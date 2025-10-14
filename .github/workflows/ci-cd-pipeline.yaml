@@ -1,0 +1,91 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+  CLUSTER_NAME: ${{ secrets.CLUSTER_NAME }}
+  KUSTOMIZE_OVERLAY: dev  # Change to staging/prod for other environments
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Configure AWS CLI
+        run: |
+          aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+          aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+          aws configure set region $AWS_REGION
+
+      - name: Authenticate Docker to ECR
+        run: |
+          aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REPOSITORY
+
+      - name: Build Docker image
+        run: docker build -t ci-cd-app:latest ./app
+
+      - name: Tag Docker image
+        run: docker tag ci-cd-app:latest $ECR_REPOSITORY:latest
+
+      - name: Push Docker image to ECR
+        run: docker push $ECR_REPOSITORY:latest
+
+      - name: Setup kubectl
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name $CLUSTER_NAME --region $AWS_REGION
+
+      - name: Ensure namespace exists
+        run: kubectl get namespace $KUSTOMIZE_OVERLAY || kubectl create namespace $KUSTOMIZE_OVERLAY
+
+      - name: Create/update ECR image pull secret
+        run: |
+          kubectl delete secret ecr-registry -n $KUSTOMIZE_OVERLAY || true
+          kubectl create secret docker-registry ecr-registry \
+            --docker-server=$ECR_REPOSITORY \
+            --docker-username=AWS \
+            --docker-password=$(aws ecr get-login-password --region $AWS_REGION) \
+            -n $KUSTOMIZE_OVERLAY
+
+      - name: Deploy to EKS with Kustomize overlay
+        run: kubectl apply -k kustomize/overlays/$KUSTOMIZE_OVERLAY
+
+      - name: Patch deployment with imagePullSecrets
+        run: |
+          kubectl patch deployment web-deployment \
+            -n $KUSTOMIZE_OVERLAY \
+            -p '{"spec":{"template":{"spec":{"imagePullSecrets":[{"name":"ecr-registry"}]}}}}'
+
+      - name: Update deployment container image
+        run: |
+          kubectl set image deployment/web-deployment \
+            my-node-app=$ECR_REPOSITORY:latest \
+            -n $KUSTOMIZE_OVERLAY
+
+      - name: Rollout restart deployment
+        run: kubectl rollout restart deployment/web-deployment -n $KUSTOMIZE_OVERLAY
+
+      - name: Wait for deployment rollout
+        run: kubectl rollout status deployment/web-deployment -n $KUSTOMIZE_OVERLAY --timeout=180s
+
+      - name: Verify deployment
+        run: |
+          kubectl get pods -n $KUSTOMIZE_OVERLAY
+          kubectl get svc -n $KUSTOMIZE_OVERLAY
+          kubectl get ingress -n $KUSTOMIZE_OVERLAY
